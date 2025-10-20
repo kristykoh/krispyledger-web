@@ -444,11 +444,13 @@ def main():
     # --- Deployment Logic ---
     if WEBHOOK_URL and BOT_TOKEN:
         logger.info(f"✅ Running in WEBHOOK mode. URL: {WEBHOOK_URL} listening on port {PORT}")
+        # FIX: Using a simple, static path for the webhook listener is more robust.
+        # The external webhook URL is set to use this same path.
         app.run_webhook(
             listen="0.0.0.0",
             port=PORT,
-            url_path=BOT_TOKEN, 
-            webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}"
+            url_path="webhook", # Changed from BOT_TOKEN
+            webhook_url=f"{WEBHOOK_URL}/webhook" # Changed to match the new url_path
         )
     else:
         logger.info("⚠️ Running in POLLING mode (for local development only).")

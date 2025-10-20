@@ -1,11 +1,11 @@
 import os
 import json
 import logging
-import asyncio # <-- REQUIRED FOR asyncio.get_running_loop()
+import asyncio 
 from typing import Dict, Any, Optional
 
 # Third-party libraries
-from telegram import Update
+from telegram import Update, ReplyKeyboardRemove, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -13,6 +13,7 @@ from telegram.ext import (
     ConversationHandler,
     MessageHandler,
     filters,
+    CallbackQueryHandler,
 )
 
 # Firebase Admin SDK imports
@@ -29,7 +30,30 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # --- Conversation States ---
-ADD_USER, ADD_EXPENSE, REMOVE_USER = range(3)
+# States for user management (still text-based)
+ADD_USER, REMOVE_USER = range(2) 
+# States for the new, button-driven expense conversation
+CHOOSING_PAYER, CHOOSING_PAYEE, TYPING_AMOUNT, TYPING_DESC = range(2, 6)
+
+# --- UI Assets and Helpers ---
+START_STICKER_ID = "CAACAgUAAxkBAANKaPYBrywD5hefpEij_UAdhoBzBlYAApIZAAIzVrBXhicq0dBBHfo2BA"
+SETTLE_STICKER_ID = "CAACAgUAAxkBAANLaPYBv0rdel-B2DWPXw9fzsYEneEAApUZAAIzVrBX4g5-PwqYYwE2BA"
+EXPENSE_STICKER_ID = "CAACAgUAAxkBAANZaPYFMY2-hhDFqWMrxJH3sAijDSQAAqIZAAIzVrBXQRy_bzCSPF02BA"
+
+def main_menu_keyboard():
+    """Main menu buttons."""
+    keyboard = [
+        [InlineKeyboardButton("➕ Add Expense", callback_data="add_expense")],
+        [
+            InlineKeyboardButton("📜 View Balances", callback_data="view_summary"),
+            InlineKeyboardButton("🍰 Settle Up", callback_data="settle")
+        ],
+        [
+            InlineKeyboardButton("🧾 View Expenses Log", callback_data="view_expenses_log"),
+            InlineKeyboardButton("⚙️ Manage Users", callback_data="manage_users")
+        ]
+    ]
+    return InlineKeyboardMarkup(keyboard)
 
 # --- Firestore Initialization ---
 
@@ -43,14 +67,9 @@ PORT = int(os.environ.get('PORT', 8080))
 db = None
 if FIREBASE_CREDENTIALS_JSON:
     try:
-        # Load the credentials JSON string
         cred_dict = json.loads(FIREBASE_CREDENTIALS_JSON)
-        
-        # Initialize the Firebase app
         cred = credentials.Certificate(cred_dict)
         firebase_admin.initialize_app(cred)
-        
-        # Get the Firestore client
         db = firestore.client()
         logger.info("✅ Firestore client initialized successfully.")
     except Exception as e:
@@ -60,19 +79,14 @@ else:
     logger.warning("⚠️ FIREBASE_CREDENTIALS_JSON not found. Running without persistence.")
 
 # --- Database Utility Functions (Synchronous) ---
-# These functions MUST remain synchronous as the Firebase Admin SDK is blocking.
-
 def get_chat_ref(chat_id: int):
     """Returns the Firestore document reference for a chat ledger."""
     if db:
-        # Ledger collection name (must match Firebase security rules)
         return db.collection("krispy_ledgers").document(str(chat_id))
     return None
 
 def get_chat_data_sync(chat_id: int) -> Dict[str, Any]:
-    """
-    Synchronously fetches chat data from Firestore. Runs in an executor thread.
-    """
+    """Synchronously fetches chat data from Firestore."""
     if not db:
         logger.warning(f"Database not initialized for chat {chat_id}. Returning default data.")
         return {"users": {}, "expenses": [], "next_expense_id": 1}
@@ -81,9 +95,7 @@ def get_chat_data_sync(chat_id: int) -> Dict[str, Any]:
     try:
         doc = doc_ref.get() 
         if doc.exists:
-            # Firestore stores data in a dictionary
             data = doc.to_dict()
-            # Ensure required keys exist with default values
             return {
                 "users": data.get("users", {}),
                 "expenses": data.get("expenses", []),
@@ -94,14 +106,11 @@ def get_chat_data_sync(chat_id: int) -> Dict[str, Any]:
             return {"users": {}, "expenses": [], "next_expense_id": 1}
     except Exception as e:
         logger.error(f"Error fetching data for chat {chat_id}: {e}")
-        # Return default structure on error to allow bot to continue running without persistence
         return {"users": {}, "expenses": [], "next_expense_id": 1}
 
 
 def save_chat_data_sync(chat_id: int, chat_data: Dict[str, Any]) -> None:
-    """
-    Synchronously saves chat data to Firestore. Runs in an executor thread.
-    """
+    """Synchronously saves chat data to Firestore."""
     if not db:
         return
 
@@ -115,15 +124,10 @@ def save_chat_data_sync(chat_id: int, chat_data: Dict[str, Any]) -> None:
 # --- Helper Functions for Data Access (Asynchronous) ---
 
 async def load_chat_data_async(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Loads chat data from Firestore into context.chat_data using an executor.
-    Requires chat_id to be passed explicitly from the handler.
-    """
-    # FIX: Use asyncio.get_running_loop() as context.application.loop is deprecated/removed in PTB v20+
+    """Loads chat data from Firestore into context.chat_data."""
     app_loop = asyncio.get_running_loop() 
 
     if "data_loaded" not in context.chat_data:
-        # Await the synchronous call running in a separate thread
         logger.info(f"Asynchronously loading data for chat {chat_id}")
         data = await app_loop.run_in_executor(None, get_chat_data_sync, chat_id)
         
@@ -131,11 +135,7 @@ async def load_chat_data_async(chat_id: int, context: ContextTypes.DEFAULT_TYPE)
         context.chat_data["data_loaded"] = True
 
 def get_chat_data(context: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
-    """
-    Retrieves chat data from context.chat_data. 
-    Assumes load_chat_data_async has already been awaited.
-    """
-    # Defensive check: if 'users' isn't in chat_data, data wasn't loaded or an error occurred.
+    """Retrieves chat data from context.chat_data."""
     if "users" not in context.chat_data:
          logger.error("🚨 get_chat_data called before data was loaded asynchronously.")
          return {"users": {}, "expenses": [], "next_expense_id": 1}
@@ -143,17 +143,9 @@ def get_chat_data(context: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
     return context.chat_data
 
 async def save_chat_data_async(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Saves chat data back to Firestore using an executor.
-    Requires chat_id to be passed explicitly from the handler.
-    """
-    # FIX: Use asyncio.get_running_loop() 
+    """Saves chat data back to Firestore."""
     app_loop = asyncio.get_running_loop()
-    
-    # We save the entire chat_data dictionary, excluding the 'data_loaded' flag
     data_to_save = {k: v for k, v in context.chat_data.items() if k != "data_loaded"}
-    
-    # Await the synchronous call running in a separate thread
     await app_loop.run_in_executor(None, save_chat_data_sync, chat_id, data_to_save)
 
 
@@ -166,17 +158,13 @@ def calculate_balances(chat_data: Dict[str, Any]) -> Dict[str, float]:
         payer = expense["payer"]
         amount = expense["amount"]
         
-        # Simple split: evenly distributed among all users (including payer)
         num_users = len(chat_data["users"])
-        if num_users == 0:
-            continue
+        if num_users == 0: continue
 
         share = amount / num_users
 
-        # Payer is credited the full amount
         balances[payer] += amount
 
-        # Each user (including payer) is debited their share
         for user in chat_data["users"].keys():
             balances[user] -= share
 
@@ -189,16 +177,14 @@ def format_balances(balances: Dict[str, float]) -> str:
 
     output = ["**Current Balances:**"]
     for user, balance in balances.items():
-        # Round to two decimal places for display
         balance = round(balance, 2)
         if abs(balance) < 0.01:
-            output.append(f"• {user}: Settled up.")
+            output.append(f"• {user}: Settled up. ✅")
         elif balance > 0:
-            output.append(f"• {user}: is Owed **${balance:.2f}**")
+            output.append(f"• {user}: is Owed **${balance:.2f}** 💸")
         else:
-            output.append(f"• {user}: Owes **${-balance:.2f}**")
+            output.append(f"• {user}: Owes **${-balance:.2f}** 💰")
     
-    # Calculate simple one-to-one settlements (optional but helpful)
     summary = simplify_settlements(balances)
     if summary:
         output.append("\n**Settlement Suggestions:**")
@@ -208,27 +194,20 @@ def format_balances(balances: Dict[str, float]) -> str:
 
 def simplify_settlements(balances: Dict[str, float]) -> list[str]:
     """Generates simple settlement suggestions."""
-    # Round balances to avoid floating point issues
     rounded_balances = {user: round(balance, 2) for user, balance in balances.items() if abs(balance) >= 0.01}
     
-    # Separate debtors (negative balance) and creditors (positive balance)
     debtors = {user: -balance for user, balance in rounded_balances.items() if balance < 0}
     creditors = {user: balance for user, balance in rounded_balances.items() if balance > 0}
     
     suggestions = []
-
-    # Simple greedy algorithm for settlement
     debtor_list = list(debtors.items())
     creditor_list = list(creditors.items())
-
-    # We use indices to track progress through the sorted lists
     i, j = 0, 0 
 
     while i < len(debtor_list) and j < len(creditor_list):
         debtor_name, owed_amount = debtor_list[i]
         creditor_name, receives_amount = creditor_list[j]
 
-        # Find the minimum transaction amount
         amount_to_settle = min(owed_amount, receives_amount)
         
         if amount_to_settle > 0.01:
@@ -236,83 +215,69 @@ def simplify_settlements(balances: Dict[str, float]) -> list[str]:
                 f"• {debtor_name} pays {creditor_name} **${amount_to_settle:.2f}**"
             )
 
-        # Update remaining amounts
         debtor_list[i] = (debtor_name, owed_amount - amount_to_settle)
         creditor_list[j] = (creditor_name, receives_amount - amount_to_settle)
         
-        # Move to the next person if their balance is settled
-        if debtor_list[i][1] < 0.01:
-            i += 1  # Debtor settled their debt
-        
-        if creditor_list[j][1] < 0.01:
-            j += 1  # Creditor received full amount
+        if debtor_list[i][1] < 0.01: i += 1
+        if creditor_list[j][1] < 0.01: j += 1
 
     return suggestions
 
-# --- Command Handlers (Updated to pass chat_id) ---
+# --- UI Content Generation ---
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Sends a welcome message and initializes the ledger."""
-    # RELIABLE: Use update.effective_chat.id as the source of truth
-    chat_id = update.effective_chat.id
-    
-    # Pass the reliable chat_id to the data loader
-    await load_chat_data_async(chat_id, context)
-    chat_data = get_chat_data(context) 
-    
-    welcome_message = (
-        "👋 Welcome to **KrispyLedger**! Your quick and easy expense tracker.\n\n"
-        "**Your Ledger ID:** `{}`\n\n"
-        "**Available Commands:**\n"
-        "• /adduser - Start adding users to the ledger.\n"
-        "• /addexpense - Start adding an expense.\n"
-        "• /view - View current balances and expenses.\n"
-        "• /removeuser - Remove a user from the ledger.\n"
-        "• /clear - Clear all users and expenses.\n"
-    ).format(chat_id)
-
-    await update.message.reply_text(welcome_message, parse_mode='Markdown')
-
-async def view_ledger(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Displays the current users, expenses, and balances."""
-    chat_id = update.effective_chat.id
+async def get_summary_text(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> str:
+    """Generates the text for the View Balances button."""
     await load_chat_data_async(chat_id, context)
     chat_data = get_chat_data(context)
     
     if not chat_data["users"]:
-        await update.message.reply_text(
-            "The ledger is empty! Use /adduser to add people and /addexpense to record costs."
-        )
-        return
+        return "The ledger is empty! Use 'Manage Users' to add people."
 
-    # 1. Users List
     users_list = ", ".join(chat_data["users"].keys())
-    
-    # 2. Expenses List
-    expense_details = []
-    if chat_data["expenses"]:
-        expense_details.append("**Expenses:**")
-        for exp in chat_data["expenses"]:
-            expense_details.append(
-                f"• ID {exp['id']} | **{exp['description']}** | Paid by {exp['payer']} | ${exp['amount']:.2f}"
-            )
-    else:
-        expense_details.append("No expenses recorded yet. Use /addexpense.")
-
-    # 3. Balances
     balances = calculate_balances(chat_data)
     balances_text = format_balances(balances)
 
-    response = (
-        f"**Users in Ledger:** {users_list}\n\n"
-        f"{'\n'.join(expense_details)}\n\n"
+    return (
+        f"**👥 Users in Ledger:** {users_list}\n\n"
         f"{balances_text}"
     )
 
-    await update.message.reply_text(response, parse_mode='Markdown')
+async def get_expenses_log_text(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> str:
+    """Generates the detailed log of expenses."""
+    await load_chat_data_async(chat_id, context)
+    chat_data = get_chat_data(context)
+    
+    expense_details = []
+    if chat_data["expenses"]:
+        expense_details.append("**Expenses Log:**")
+        for exp in chat_data["expenses"]:
+            expense_details.append(
+                f"• ID {exp['id']} | Paid by **{exp['payer']}** | ${exp['amount']:.2f} for *{exp['description']}*"
+            )
+    else:
+        expense_details.append("No expenses recorded yet.")
+    
+    return "\n".join(expense_details)
+
+# --- Command Handlers ---
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Sends a welcome message with the main menu."""
+    chat_id = update.effective_chat.id
+    await load_chat_data_async(chat_id, context)
+    
+    welcome_message = "🌸 Welcome to **KrispyLedger**! Your quick and easy expense tracker. Tap a button to start:"
+    
+    # Send sticker first, then the menu message
+    await update.message.reply_sticker(START_STICKER_ID)
+    await update.message.reply_text(
+        welcome_message, 
+        parse_mode='Markdown', 
+        reply_markup=main_menu_keyboard()
+    )
 
 async def clear_ledger(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Clears all users and expenses from the ledger."""
+    """Clears all users and expenses from the ledger (Used if /clear is typed)."""
     chat_id = update.effective_chat.id
     await load_chat_data_async(chat_id, context)
     chat_data = get_chat_data(context)
@@ -322,24 +287,198 @@ async def clear_ledger(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     chat_data["next_expense_id"] = 1
     
     await save_chat_data_async(chat_id, context)
+    await update.message.reply_sticker(SETTLE_STICKER_ID)
     await update.message.reply_text(
-        "🗑️ Ledger cleared! All users and expenses have been removed."
+        "🗑️ Ledger cleared! All balances, users, and expenses have been removed.",
+        reply_markup=main_menu_keyboard()
     )
 
-# --- Add User Conversation Handlers ---
+# --- Conversation Entry Point (for /addexpense command) ---
+
+async def start_add_expense_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Starts the expense conversation when the user types /addexpense."""
+    chat_id = update.effective_chat.id
+    await load_chat_data_async(chat_id, context)
+    chat_data = get_chat_data(context)
+    users = list(chat_data["users"].keys())
+    
+    if not users:
+        await update.message.reply_text(
+            "❌ Please add users first using /adduser (via text command).", 
+            reply_markup=main_menu_keyboard()
+        )
+        return ConversationHandler.END
+
+    context.user_data['expense_data'] = {} 
+    keyboard = [[InlineKeyboardButton(user, callback_data=f"payer_{user}")] for user in users]
+    keyboard.append([InlineKeyboardButton("⬅️ Back to Menu", callback_data="menu")])
+    
+    # Send a new message to start the flow
+    await update.message.reply_text("🧐 Who paid for the expense?", reply_markup=InlineKeyboardMarkup(keyboard))
+    return CHOOSING_PAYER
+
+
+# --- Main Callback Query Handler ---
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles all Inline Keyboard button presses."""
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    chat_id = update.effective_chat.id
+    
+    # --- Main Menu Handling (Conversation Entry/Exit) ---
+    if data == "add_expense":
+        # Simulate pressing the command
+        return await start_add_expense_command(update, context)
+
+    elif data == "view_summary":
+        summary_text = await get_summary_text(chat_id, context)
+        await query.edit_message_text(summary_text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
+        return ConversationHandler.END
+        
+    elif data == "view_expenses_log":
+        log_text = await get_expenses_log_text(chat_id, context)
+        await query.edit_message_text(log_text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
+        return ConversationHandler.END
+
+    elif data == "manage_users":
+        await query.edit_message_text(
+            "👥 **User Management**\n\nUse the following *text commands* (type them in the input bar) to manage users:\n"
+            "• /adduser - Start adding users\n"
+            "• /removeuser - Start removing users\n\n"
+            "_Note: This requires typing names exactly._",
+            parse_mode="Markdown",
+            reply_markup=main_menu_keyboard()
+        )
+        return ConversationHandler.END
+        
+    elif data == "settle":
+        # Clear all data
+        await load_chat_data_async(chat_id, context)
+        chat_data = get_chat_data(context)
+        chat_data["users"] = {}
+        chat_data["expenses"] = []
+        chat_data["next_expense_id"] = 1
+        await save_chat_data_async(chat_id, context)
+        
+        await query.message.reply_sticker(SETTLE_STICKER_ID)
+        await query.edit_message_text("🍰 All balances cleared and ledger reset!", reply_markup=main_menu_keyboard())
+        return ConversationHandler.END
+        
+    elif data == "menu":
+        await query.edit_message_text("🌸 Main menu:", reply_markup=main_menu_keyboard())
+        return ConversationHandler.END
+        
+    # --- Conversation State Transitions for ADD_EXPENSE (only valid during conversation) ---
+    
+    # CHOOSING_PAYER -> CHOOSING_PAYEE
+    if data.startswith("payer_"):
+        payer = data.split("_")[1]
+        context.user_data['expense_data']['payer'] = payer
+        
+        chat_data = get_chat_data(context)
+        users = list(chat_data["users"].keys())
+        
+        # Payee selection logic (only available users who aren't the payer)
+        keyboard = [[InlineKeyboardButton(u, callback_data=f"payee_{u}")] for u in users if u != payer]
+        keyboard.append([InlineKeyboardButton("⬅️ Back to Menu", callback_data="menu")])
+        
+        await query.edit_message_text(
+            f"💰 Payer: **{payer}**\n\nWho owes the payer? (For a simple split, select the other person)",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
+        )
+        return CHOOSING_PAYEE
+        
+    # CHOOSING_PAYEE -> TYPING_AMOUNT
+    elif data.startswith("payee_"):
+        payee = data.split("_")[1]
+        
+        # NOTE: We ignore the 'payee' in the final transaction logic since we use a general split
+        # but we keep it here to follow the user's intended flow (if they want 1:1 splits later)
+        context.user_data['expense_data']['payee'] = payee 
+        
+        # Remove the keyboard so the user can type the amount
+        await query.edit_message_text(
+            f"👤 Payer: **{context.user_data['expense_data']['payer']}**\n\n_Please send the **total amount** (e.g., 15.75) as a regular message._",
+            parse_mode="Markdown"
+        )
+        return TYPING_AMOUNT
+
+    return ConversationHandler.END
+
+
+# --- Text Message Handlers (TYPING_AMOUNT / TYPING_DESC) ---
+
+async def amount_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the user typing the amount."""
+    try:
+        amount = float(update.message.text.strip())
+        if amount <= 0: raise ValueError
+    except ValueError:
+        await update.message.reply_text("⚠️ Invalid amount. Please enter a positive number (e.g., 15.75).")
+        return TYPING_AMOUNT
+        
+    context.user_data['expense_data']['amount'] = amount
+    
+    await update.message.reply_text("📝 Now, please send a description for this expense (e.g., Dinner):")
+    return TYPING_DESC
+
+async def desc_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles the user typing the description and finalizes the expense."""
+    chat_id = update.effective_chat.id
+    await load_chat_data_async(chat_id, context)
+    chat_data = get_chat_data(context)
+    
+    description = update.message.text.strip()
+    if not description:
+        await update.message.reply_text("Description cannot be empty. Please try again.")
+        return TYPING_DESC
+
+    expense_data = context.user_data["expense_data"]
+    
+    # Finalize expense data and use the general Splitwise model (split among all users)
+    new_expense = {
+        "id": chat_data["next_expense_id"],
+        "payer": expense_data["payer"],
+        "amount": expense_data["amount"],
+        "description": description,
+    }
+
+    chat_data["expenses"].append(new_expense)
+    chat_data["next_expense_id"] += 1
+    
+    await save_chat_data_async(chat_id, context)
+    
+    await update.message.reply_sticker(EXPENSE_STICKER_ID)
+    summary_text = await get_summary_text(chat_id, context)
+    
+    await update.message.reply_text(
+        f"✅ Expense recorded! ID {new_expense['id']}: **{description}** (Paid by {new_expense['payer']} for ${new_expense['amount']:.2f}).\n\n"
+        f"{summary_text}",
+        parse_mode="Markdown",
+        reply_markup=main_menu_keyboard()
+    )
+    
+    context.user_data.pop("expense_data", None) 
+    return ConversationHandler.END
+
+# --- User Management Handlers (Modified for UI consistency) ---
 
 async def add_user_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Starts the conversation for adding users."""
     chat_id = update.effective_chat.id
     await load_chat_data_async(chat_id, context)
+    # Ensure ReplyKeyboardRemove is used to clear any lingering keyboards
     await update.message.reply_text(
-        "Please send the name of the user you want to add (e.g., Jane Doe). Send /done when finished."
+        "Please send the name of the user you want to add (e.g., Jane Doe). Send /done when finished.",
+        reply_markup=ReplyKeyboardRemove() 
     )
     return ADD_USER
 
 async def add_user_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Processes the user name and adds it to the ledger."""
-    # Data is guaranteed to be loaded from the entry point (add_user_start)
     chat_id = update.effective_chat.id
     chat_data = get_chat_data(context)
 
@@ -353,8 +492,7 @@ async def add_user_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         await update.message.reply_text(f"User **{user_name}** is already in the ledger. Send another name or /done.", parse_mode='Markdown')
         return ADD_USER
 
-    # Add user
-    chat_data["users"][user_name] = {}  # Placeholder for future user metadata
+    chat_data["users"][user_name] = {}
     
     await save_chat_data_async(chat_id, context)
     await update.message.reply_text(
@@ -363,107 +501,9 @@ async def add_user_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     return ADD_USER
 
 async def add_user_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Ends the conversation for adding users."""
-    await update.message.reply_text("Finished adding users. Use /view to check your ledger.")
+    """Ends the conversation for adding users and returns to the main menu."""
+    await update.message.reply_text("Finished adding users. Returning to main menu.", reply_markup=main_menu_keyboard())
     return ConversationHandler.END
-
-# --- Add Expense Conversation Handlers ---
-
-async def add_expense_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Starts the conversation for adding an expense."""
-    chat_id = update.effective_chat.id
-    await load_chat_data_async(chat_id, context)
-    chat_data = get_chat_data(context)
-    
-    if not chat_data["users"]:
-        await update.message.reply_text("Please add users first using /adduser before adding expenses.")
-        return ConversationHandler.END
-
-    user_names = ", ".join(chat_data["users"].keys())
-    context.user_data["expense_data"] = {} # Initialize temporary storage
-
-    await update.message.reply_text(
-        f"💰 Who paid for this expense? \nAvailable users: {user_names}",
-        parse_mode='Markdown'
-    )
-    return ADD_EXPENSE
-
-async def add_expense_payer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Processes the payer and prompts for the amount."""
-    # Data is guaranteed to be loaded from the entry point (add_expense_start)
-    chat_data = get_chat_data(context)
-
-    payer_name = update.message.text.strip()
-
-    if payer_name not in chat_data["users"]:
-        await update.message.reply_text(
-            f"User **{payer_name}** not found. Please type a name from the available users, or /cancel.", 
-            parse_mode='Markdown'
-        )
-        return ADD_EXPENSE
-    
-    context.user_data["expense_data"]["payer"] = payer_name
-    await update.message.reply_text(
-        f"How much did **{payer_name}** pay? (e.g., 15.75)", 
-        parse_mode='Markdown'
-    )
-    return ADD_EXPENSE
-
-async def add_expense_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Processes the amount and prompts for the description."""
-    try:
-        # We allow both integer and float inputs
-        amount = float(update.message.text.strip()) 
-        if amount <= 0:
-            await update.message.reply_text("Amount must be a positive number. Please try again.")
-            return ADD_EXPENSE
-        
-        context.user_data["expense_data"]["amount"] = amount
-        await update.message.reply_text(
-            "What was this expense for? (e.g., Groceries, Dinner, Tickets)"
-        )
-        return ADD_EXPENSE
-        
-    except ValueError:
-        await update.message.reply_text("Invalid amount. Please enter a number (e.g., 15.75).")
-        return ADD_EXPENSE
-
-async def add_expense_description(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Processes the description and saves the expense."""
-    # Data is guaranteed to be loaded from the entry point (add_expense_start)
-    chat_id = update.effective_chat.id
-    chat_data = get_chat_data(context)
-
-    description = update.message.text.strip()
-    if not description:
-        await update.message.reply_text("Description cannot be empty. Please try again.")
-        return ADD_EXPENSE
-
-    expense_data = context.user_data["expense_data"]
-
-    # Finalize expense data
-    new_expense = {
-        "id": chat_data["next_expense_id"],
-        "payer": expense_data["payer"],
-        "amount": expense_data["amount"],
-        "description": description,
-    }
-
-    chat_data["expenses"].append(new_expense)
-    chat_data["next_expense_id"] += 1
-    
-    await save_chat_data_async(chat_id, context)
-
-    await update.message.reply_text(
-        f"✅ Expense recorded! ID {new_expense['id']}: **{description}** (Paid by {new_expense['payer']} for ${new_expense['amount']:.2f}).\n\nUse /view to see the new balances.",
-        parse_mode='Markdown'
-    )
-    
-    # Clear temporary state
-    context.user_data.pop("expense_data", None) 
-    return ConversationHandler.END
-
-# --- Remove User Conversation Handlers ---
 
 async def remove_user_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Starts the conversation for removing a user."""
@@ -472,19 +512,19 @@ async def remove_user_start(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     chat_data = get_chat_data(context)
     
     if not chat_data["users"]:
-        await update.message.reply_text("No users in the ledger to remove.")
+        await update.message.reply_text("No users in the ledger to remove.", reply_markup=main_menu_keyboard())
         return ConversationHandler.END
 
     user_names = ", ".join(chat_data["users"].keys())
     await update.message.reply_text(
-        f"Who do you want to remove? This will also remove any expenses they paid.\nAvailable users: {user_names}",
-        parse_mode='Markdown'
+        f"Who do you want to remove? This will also remove any expenses they paid.\nAvailable users: {user_names}\n\n_Please reply with the exact name._",
+        parse_mode='Markdown',
+        reply_markup=ReplyKeyboardRemove() # Remove keyboard for text entry
     )
     return REMOVE_USER
 
 async def remove_user_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Removes the specified user and their associated expenses."""
-    # Data is guaranteed to be loaded from the entry point (remove_user_start)
     chat_id = update.effective_chat.id
     chat_data = get_chat_data(context)
 
@@ -497,10 +537,7 @@ async def remove_user_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
         return REMOVE_USER
 
-    # 1. Remove user
     chat_data["users"].pop(user_to_remove)
-
-    # 2. Remove expenses paid by this user
     original_expense_count = len(chat_data["expenses"])
     chat_data["expenses"] = [
         exp for exp in chat_data["expenses"] if exp["payer"] != user_to_remove
@@ -513,7 +550,7 @@ async def remove_user_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if expenses_removed_count > 0:
         response += f" Also removed {expenses_removed_count} expenses paid by them."
 
-    await update.message.reply_text(response, parse_mode='Markdown')
+    await update.message.reply_text(response, parse_mode='Markdown', reply_markup=main_menu_keyboard())
     return ConversationHandler.END
 
 
@@ -521,113 +558,116 @@ async def remove_user_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Cancels and ends the current conversation."""
-    # Clear any temporary user state used by the conversation
     if "expense_data" in context.user_data:
         context.user_data.pop("expense_data")
+        
+    # Check if we need to reply to a message or edit a callback query
+    if update.message:
+        await update.message.reply_text("❌ Operation cancelled.", reply_markup=main_menu_keyboard())
+    elif update.callback_query:
+        await update.callback_query.edit_message_text("❌ Operation cancelled.", reply_markup=main_menu_keyboard())
 
-    await update.message.reply_text(
-        "Operation cancelled. Use /view to check your ledger."
-    )
     return ConversationHandler.END
 
 
 async def handle_error(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Logs Errors caused by Updates."""
     logger.error(f"Update {update} caused error {context.error}")
-    # Optional: send a user-friendly message
     if update.effective_message:
         await update.effective_message.reply_text(
-            "Oops! An internal error occurred. Please try the command again or use /start."
+            "Oops! An internal error occurred. Please try the command again or use /start.",
+            reply_markup=main_menu_keyboard()
         )
 
 # --- Main Application Logic ---
 
 def main() -> None:
     """Start the bot."""
-    # Use 'global' to reference the module-level variables (WEBHOOK_URL and BOT_TOKEN)
     global BOT_TOKEN, WEBHOOK_URL 
 
     if not BOT_TOKEN or not WEBHOOK_URL:
         logger.error("❌ BOT_TOKEN or WEBHOOK_URL not set in environment variables.")
         return
 
-    # Create the Application and pass it your bot's token.
     application = Application.builder().token(BOT_TOKEN).concurrent_updates(True).build()
 
     # --- Conversation Handlers ---
+    
+    # 1. Add User Conversation (Text-based)
     add_user_handler = ConversationHandler(
         entry_points=[CommandHandler("adduser", add_user_start)],
         states={
             ADD_USER: [
-                MessageHandler(
-                    filters.TEXT & ~filters.COMMAND, add_user_name
-                ),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_user_name),
                 CommandHandler("done", add_user_done),
             ]
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
-    add_expense_handler = ConversationHandler(
-        entry_points=[CommandHandler("addexpense", add_expense_start)],
-        states={
-            ADD_EXPENSE: [
-                # Payer
-                MessageHandler(
-                    filters.TEXT & ~filters.COMMAND, add_expense_payer
-                ),
-                # Amount (will re-enter ADD_EXPENSE if not a number)
-                MessageHandler(
-                    filters.Regex(r'^\d+(\.\d{1,2})?$') & ~filters.COMMAND, add_expense_amount
-                ),
-                # Description
-                MessageHandler(
-                    filters.TEXT & ~filters.COMMAND, add_expense_description
-                ),
-            ]
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
-
+    # 2. Remove User Conversation (Text-based)
     remove_user_handler = ConversationHandler(
         entry_points=[CommandHandler("removeuser", remove_user_start)],
         states={
             REMOVE_USER: [
-                MessageHandler(
-                    filters.TEXT & ~filters.COMMAND, remove_user_name
-                )
+                MessageHandler(filters.TEXT & ~filters.COMMAND, remove_user_name)
             ]
         },
         fallbacks=[CommandHandler("cancel", cancel)],
+    )
+    
+    # 3. Add Expense Conversation (Button/Text mixed)
+    expense_conv_handler = ConversationHandler(
+        # Entry points: Button press OR Command type
+        entry_points=[
+            CallbackQueryHandler(button_handler, pattern="^add_expense$"),
+            CommandHandler("addexpense", start_add_expense_command)
+        ],
+        states={
+            # Button States (Handled by the general button_handler for selection)
+            CHOOSING_PAYER: [
+                CallbackQueryHandler(button_handler, pattern="^payer_.*$"),
+                CallbackQueryHandler(button_handler, pattern="^menu$") 
+            ],
+            CHOOSING_PAYEE: [
+                CallbackQueryHandler(button_handler, pattern="^payee_.*$"),
+                CallbackQueryHandler(button_handler, pattern="^menu$")
+            ],
+            # Text Input States (Handled by specific MessageHandlers)
+            TYPING_AMOUNT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, amount_handler)
+            ],
+            TYPING_DESC: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, desc_handler)
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+        allow_reentry=True
     )
 
 
     # --- Command Handlers ---
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("view", view_ledger))
     application.add_handler(CommandHandler("clear", clear_ledger))
 
     # --- Conversation Handlers ---
     application.add_handler(add_user_handler)
-    application.add_handler(add_expense_handler)
     application.add_handler(remove_user_handler)
+    application.add_handler(expense_conv_handler)
+    
+    # --- General Callback Handler (for main menu buttons that don't start a conversation) ---
+    application.add_handler(
+        CallbackQueryHandler(button_handler, pattern="^(view_summary|settle|manage_users|menu|view_expenses_log)$")
+    )
 
     # --- Error Handler ---
     application.add_error_handler(handle_error)
 
     # --- Start the Bot (Webhook Mode) ---
-
-    # Extract the token from the BOT_TOKEN variable for the webhook path
     webhook_path = "/" + BOT_TOKEN 
-    
-    # Check if the URL already has a trailing slash. If it does, we strip it.
-    if WEBHOOK_URL.endswith('/'):
-        WEBHOOK_URL = WEBHOOK_URL.rstrip('/')
-
-    # This is the full URL Telegram needs to send updates to:
+    if WEBHOOK_URL.endswith('/'): WEBHOOK_URL = WEBHOOK_URL.rstrip('/')
     full_webhook_url = WEBHOOK_URL + webhook_path
     
-    # We must explicitly set the webhook to the full URL path
     application.run_webhook(
         listen="0.0.0.0",
         port=PORT,

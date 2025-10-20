@@ -71,8 +71,6 @@ def get_chat_ref(chat_id: int):
 def get_chat_data_sync(chat_id: int) -> Dict[str, Any]:
     """
     Synchronously fetches chat data from Firestore.
-    NOTE: Removed 'async' and 'await' from the function signature and body 
-    to fix TypeError: object DocumentSnapshot can't be used in 'await' expression.
     """
     if not db:
         logger.warning(f"Database not initialized for chat {chat_id}. Returning default data.")
@@ -80,7 +78,6 @@ def get_chat_data_sync(chat_id: int) -> Dict[str, Any]:
 
     doc_ref = get_chat_ref(chat_id)
     try:
-        # IMPORTANT FIX: Remove 'await' here. doc_ref.get() is synchronous.
         doc = doc_ref.get() 
         if doc.exists:
             # Firestore stores data in a dictionary
@@ -102,15 +99,12 @@ def get_chat_data_sync(chat_id: int) -> Dict[str, Any]:
 def save_chat_data_sync(chat_id: int, chat_data: Dict[str, Any]) -> None:
     """
     Synchronously saves chat data to Firestore.
-    NOTE: Removed 'async' and 'await' from the function signature and body 
-    to fix TypeError: object DocumentSnapshot can't be used in 'await' expression.
     """
     if not db:
         return
 
     doc_ref = get_chat_ref(chat_id)
     try:
-        # IMPORTANT FIX: Remove 'await' here. doc_ref.set() is synchronous.
         doc_ref.set(chat_data) 
         logger.info(f"Data saved for chat {chat_id}.")
     except Exception as e:
@@ -120,6 +114,7 @@ def save_chat_data_sync(chat_id: int, chat_data: Dict[str, Any]) -> None:
 
 def get_chat_data(context: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
     """Retrieves chat data from context or loads it from Firestore (synchronously)."""
+    # Use context.job.chat_id if available (for scheduled jobs), otherwise use effective_chat.id
     chat_id = context.job.chat_id if context.job else context.effective_chat.id
     if "data_loaded" not in context.chat_data:
         # Load data from Firestore synchronously on first access
@@ -169,6 +164,8 @@ def format_balances(balances: Dict[str, float]) -> str:
 
     output = ["**Current Balances:**"]
     for user, balance in balances.items():
+        # Round to two decimal places for display
+        balance = round(balance, 2)
         if abs(balance) < 0.01:
             output.append(f"• {user}: Settled up.")
         elif balance > 0:
@@ -376,7 +373,8 @@ async def add_expense_payer(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 async def add_expense_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Processes the amount and prompts for the description."""
     try:
-        amount = float(update.message.text.strip())
+        # We allow both integer and float inputs
+        amount = float(update.message.text.strip()) 
         if amount <= 0:
             await update.message.reply_text("Amount must be a positive number. Please try again.")
             return ADD_EXPENSE
@@ -499,6 +497,10 @@ async def handle_error(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 def main() -> None:
     """Start the bot."""
+    # FIX: Use 'global' to reference the module-level variables (WEBHOOK_URL and BOT_TOKEN)
+    # This prevents the UnboundLocalError when WEBHOOK_URL is reassigned later.
+    global BOT_TOKEN, WEBHOOK_URL 
+
     if not BOT_TOKEN or not WEBHOOK_URL:
         logger.error("❌ BOT_TOKEN or WEBHOOK_URL not set in environment variables.")
         return

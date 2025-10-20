@@ -3,76 +3,90 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>KrispyLedger Café</title>
+  <title>KrispyLedger</title>
   <style>
+    @import url('https://fonts.googleapis.com/css2?family=Poppins:wght@400;500&display=swap');
+
     body {
-      font-family: "Poppins", "Comic Sans MS", sans-serif;
-      background: linear-gradient(180deg, #ffe6f0, #fff6fa);
-      color: #ff69b4;
-      text-align: center;
+      background: linear-gradient(135deg, #fdf6f0, #e6f5f8);
+      font-family: 'Poppins', sans-serif;
+      color: #333;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      height: 100vh;
       margin: 0;
-      padding: 0;
     }
-    h1 {
-      font-size: 2em;
-      color: #ff4fa0;
-      margin-top: 30px;
-    }
+
     .card {
       background: white;
-      border-radius: 20px;
-      box-shadow: 0 4px 12px rgba(255, 0, 120, 0.1);
-      padding: 20px;
-      width: 85%;
-      margin: 20px auto;
+      border-radius: 1.5rem;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.05);
+      padding: 2rem 2.5rem;
+      max-width: 400px;
+      text-align: center;
+      transition: all 0.2s ease-in-out;
     }
+
+    .card:hover {
+      transform: translateY(-4px);
+      box-shadow: 0 6px 25px rgba(0,0,0,0.1);
+    }
+
+    h1 {
+      font-size: 2rem;
+      color: #2b6777;
+      margin-bottom: 1rem;
+    }
+
     button {
-      background-color: #ff91c1;
+      background: linear-gradient(135deg, #5ab9c8, #86e3ce);
       border: none;
-      border-radius: 12px;
       color: white;
-      font-size: 1.1em;
-      padding: 10px 20px;
-      margin: 8px;
+      font-weight: 500;
+      padding: 0.8rem 1.6rem;
+      border-radius: 0.6rem;
       cursor: pointer;
-      transition: background-color 0.2s ease;
+      font-size: 1rem;
+      margin: 0.6rem 0;
+      width: 80%;
+      transition: transform 0.2s ease, box-shadow 0.3s ease;
     }
+
     button:hover {
-      background-color: #ff78b0;
+      transform: scale(1.03);
+      box-shadow: 0 4px 15px rgba(90, 185, 200, 0.4);
     }
-    .footer {
-      color: #ff7bac;
-      font-size: 0.8em;
-      margin-top: 30px;
+
+    footer {
+      font-size: 0.8rem;
+      color: #888;
+      margin-top: 1.5rem;
     }
   </style>
 </head>
 <body>
-  <h1>🍓 KrispyLedger Café 🌸</h1>
-
   <div class="card">
-    <p>Welcome to your cute ledger! Track who paid whom — but make it *adorable* ✨</p>
-    <button id="addExpenseBtn">➕ Add Expense</button>
-    <button id="viewLedgerBtn">📜 View Ledger</button>
-    <button id="settleBtn">🍰 Settle Up</button>
+    <h1>🍓 KrispyLedger</h1>
+
+    <button onclick="sendToBot('add_expense')">➕ Add Expense</button>
+    <button onclick="sendToBot('view_ledger')">📜 View Ledger</button>
+    <button onclick="sendToBot('settle')">🍰 Settle Up</button>
+
+    <footer>Built with ☕ & ❤️</footer>
   </div>
 
-  <div class="footer">Made with 💖 by KrispyLedger</div>
-
-  <script src="https://telegram.org/js/telegram-web-app.js"></script>
   <script>
-    const tg = window.Telegram.WebApp;
-    tg.expand(); // make it full height
+    const tg = window.Telegram?.WebApp;
+    if (tg) tg.expand();
 
-    document.getElementById("addExpenseBtn").onclick = () => {
-      tg.sendData("add_expense"); // send to your bot
-    };
-    document.getElementById("viewLedgerBtn").onclick = () => {
-      tg.sendData("view_ledger");
-    };
-    document.getElementById("settleBtn").onclick = () => {
-      tg.sendData("settle");
-    };
+    function sendToBot(action) {
+      if (tg) {
+        tg.sendData(action);
+      } else {
+        alert("This button works inside Telegram 💬");
+      }
+    }
   </script>
 </body>
 </html>

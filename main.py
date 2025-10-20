@@ -144,30 +144,53 @@ def get_chat_data(context: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
 
 async def save_chat_data_async(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Saves chat data back to Firestore."""
+    if not db:
+        return # Skip saving if DB is not initialized
+
     app_loop = asyncio.get_running_loop()
     data_to_save = {k: v for k, v in context.chat_data.items() if k != "data_loaded"}
     await app_loop.run_in_executor(None, save_chat_data_sync, chat_id, data_to_save)
 
 
-# --- Ledger Logic Functions (Same as before) ---
+# --- Ledger Logic Functions (UPDATED CALCULATION) ---
 def calculate_balances(chat_data: Dict[str, Any]) -> Dict[str, float]:
-    """Calculates the net balance for each user."""
+    """Calculates the net balance for each user based on the expense type."""
     balances = {name: 0.0 for name in chat_data["users"].keys()}
 
     for expense in chat_data["expenses"]:
         payer = expense["payer"]
         amount = expense["amount"]
+        # Default to group_split for backward compatibility 
+        expense_type = expense.get("type", "group_split") 
+
+        if payer not in balances: continue # Skip if payer was removed
+
+        if expense_type == "group_split":
+            # Split among all active users
+            num_users = len(chat_data["users"])
+            if num_users == 0: continue
+            
+            # The expense share is calculated by dividing by the total number of users
+            share = amount / num_users
+
+            balances[payer] += amount # Payer receives full amount
+            
+            # Everyone (including payer) is debited their share
+            for user in chat_data["users"].keys():
+                balances[user] -= share
         
-        num_users = len(chat_data["users"])
-        if num_users == 0: continue
+        elif expense_type == "single_split":
+            # 50/50 split between Payer and one designated Payee
+            payee = expense["payee"]
+            if payee not in balances: continue # Skip if payee was removed
 
-        share = amount / num_users
-
-        balances[payer] += amount
-
-        for user in chat_data["users"].keys():
-            balances[user] -= share
-
+            share = amount / 2
+            
+            balances[payer] += amount # Payer receives full amount
+            balances[payer] -= share  # Payer owes their half
+            
+            balances[payee] -= share  # Payee owes their half
+        
     return balances
 
 def format_balances(balances: Dict[str, float]) -> str:
@@ -251,8 +274,16 @@ async def get_expenses_log_text(chat_id: int, context: ContextTypes.DEFAULT_TYPE
     if chat_data["expenses"]:
         expense_details.append("**Expenses Log:**")
         for exp in chat_data["expenses"]:
+            # Check for expense type to format description
+            expense_type = exp.get("type", "group_split")
+            
+            if expense_type == "single_split":
+                 description_detail = f"Split 50/50 with **{exp['payee']}** for *{exp['description']}*"
+            else:
+                 description_detail = f"Split evenly among **all {len(chat_data['users'])} users** for *{exp['description']}*"
+            
             expense_details.append(
-                f"• ID {exp['id']} | Paid by **{exp['payer']}** | ${exp['amount']:.2f} for *{exp['description']}*"
+                f"• ID {exp['id']} | Paid by **{exp['payer']}** | ${exp['amount']:.2f} | {description_detail}"
             )
     else:
         expense_details.append("No expenses recorded yet.")
@@ -298,14 +329,13 @@ async def clear_ledger(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def start_add_expense_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """
     Starts the expense conversation when the user types /addexpense or clicks the button.
-    This function must be robust against both Message and CallbackQuery updates.
+    User selects the Payer.
     """
     chat_id = update.effective_chat.id
     await load_chat_data_async(chat_id, context)
     chat_data = get_chat_data(context)
     users = list(chat_data["users"].keys())
     
-    # --- FIX APPLIED HERE: Use update.effective_message ---
     effective_message = update.effective_message
     if not effective_message:
         logger.error("start_add_expense_command: effective_message is None, cannot reply.")
@@ -313,10 +343,17 @@ async def start_add_expense_command(update: Update, context: ContextTypes.DEFAUL
 
 
     if not users:
-        await effective_message.reply_text(
-            "❌ Please add users first using /adduser (via text command).", 
-            reply_markup=main_menu_keyboard()
-        )
+        # Check if the update came from a button (callback query) or a command/message
+        if update.callback_query:
+            await update.callback_query.edit_message_text(
+                 "❌ Please add users first using /adduser (via text command).", 
+                 reply_markup=main_menu_keyboard()
+            )
+        else:
+             await effective_message.reply_text(
+                "❌ Please add users first using /adduser (via text command).", 
+                reply_markup=main_menu_keyboard()
+            )
         return ConversationHandler.END
 
     context.user_data['expense_data'] = {} 
@@ -325,7 +362,7 @@ async def start_add_expense_command(update: Update, context: ContextTypes.DEFAUL
     
     # Send a new message to start the flow
     await effective_message.reply_text(
-        "🧐 Who paid for the expense?", 
+        "🧐 Step 1: Who paid for the expense? (Select Payer)", 
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
     return CHOOSING_PAYER
@@ -393,28 +430,46 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_data = get_chat_data(context)
         users = list(chat_data["users"].keys())
         
-        # Payee selection logic (only available users who aren't the payer)
-        keyboard = [[InlineKeyboardButton(u, callback_data=f"payee_{u}")] for u in users if u != payer]
+        # Build split options
+        keyboard = [
+            [InlineKeyboardButton("👥 Split Evenly Among ALL Users", callback_data="split_group")],
+            [InlineKeyboardButton("⬇️ 50/50 Split with ONE Person:", callback_data="ignore")], # Header
+        ]
+        
+        # Individual 50/50 split options (excluding the payer)
+        keyboard.extend([
+            [InlineKeyboardButton(u, callback_data=f"split_single_{u}")] 
+            for u in users if u != payer
+        ])
+        
         keyboard.append([InlineKeyboardButton("⬅️ Back to Menu", callback_data="menu")])
         
         await query.edit_message_text(
-            f"💰 Payer: **{payer}**\n\nWho owes the payer? (For a simple split, select the other person)",
+            f"💰 Payer: **{payer}**\n\n🧐 Step 2: How should this expense be split?",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="Markdown"
         )
         return CHOOSING_PAYEE
         
-    # CHOOSING_PAYEE -> TYPING_AMOUNT
-    elif data.startswith("payee_"):
-        payee = data.split("_")[1]
+    # CHOOSING_PAYEE -> TYPING_AMOUNT (Handles both Group Split and Single Split selection)
+    elif data == "split_group" or data.startswith("split_single_"):
         
-        # NOTE: We ignore the 'payee' in the final transaction logic since we use a general split
-        # but we keep it here to follow the user's intended flow (if they want 1:1 splits later)
-        context.user_data['expense_data']['payee'] = payee 
+        payer = context.user_data['expense_data']['payer']
+        split_summary = f"Payer: **{payer}**\n"
         
+        if data == "split_group":
+            context.user_data['expense_data']['type'] = "group_split"
+            split_summary += "Type: **Split Among All Users**\n"
+        else:
+            # Single split selection
+            payee = data.split("_", 2)[2] # split_single_Jane Doe -> Jane Doe
+            context.user_data['expense_data']['type'] = "single_split"
+            context.user_data['expense_data']['payee'] = payee
+            split_summary += f"Type: **50/50 Split** with **{payee}**\n"
+            
         # Remove the keyboard so the user can type the amount
         await query.edit_message_text(
-            f"👤 Payer: **{context.user_data['expense_data']['payer']}**\n\n_Please send the **total amount** (e.g., 15.75) as a regular message._",
+            f"{split_summary}\n_Please send the **total amount** (e.g., 15.75) as a regular message._",
             parse_mode="Markdown"
         )
         return TYPING_AMOUNT
@@ -435,7 +490,7 @@ async def amount_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     context.user_data['expense_data']['amount'] = amount
     
-    await update.message.reply_text("📝 Now, please send a description for this expense (e.g., Dinner):")
+    await update.message.reply_text("📝 Step 4: Now, please send a description for this expense (e.g., Dinner):")
     return TYPING_DESC
 
 async def desc_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -451,13 +506,18 @@ async def desc_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     expense_data = context.user_data["expense_data"]
     
-    # Finalize expense data and use the general Splitwise model (split among all users)
+    # Finalize expense data and use the recorded split type
     new_expense = {
         "id": chat_data["next_expense_id"],
         "payer": expense_data["payer"],
         "amount": expense_data["amount"],
         "description": description,
+        "type": expense_data["type"], # Save the split type
     }
+    
+    # Only add payee if it's a single split
+    if new_expense["type"] == "single_split":
+        new_expense["payee"] = expense_data["payee"]
 
     chat_data["expenses"].append(new_expense)
     chat_data["next_expense_id"] += 1
@@ -467,8 +527,14 @@ async def desc_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_sticker(EXPENSE_STICKER_ID)
     summary_text = await get_summary_text(chat_id, context)
     
+    # Construct confirmation message
+    if new_expense["type"] == "single_split":
+        split_desc = f"Split 50/50 with **{new_expense['payee']}**"
+    else:
+        split_desc = "Split evenly among all"
+        
     await update.message.reply_text(
-        f"✅ Expense recorded! ID {new_expense['id']}: **{description}** (Paid by {new_expense['payer']} for ${new_expense['amount']:.2f}).\n\n"
+        f"✅ Expense recorded! ID {new_expense['id']}: **{description}** (Paid by {new_expense['payer']} for ${new_expense['amount']:.2f}, {split_desc}).\n\n"
         f"{summary_text}",
         parse_mode="Markdown",
         reply_markup=main_menu_keyboard()
@@ -552,8 +618,10 @@ async def remove_user_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     chat_data["users"].pop(user_to_remove)
     original_expense_count = len(chat_data["expenses"])
+    # Also remove expenses where the removed user was the Payer OR the single Payee
     chat_data["expenses"] = [
-        exp for exp in chat_data["expenses"] if exp["payer"] != user_to_remove
+        exp for exp in chat_data["expenses"] 
+        if exp["payer"] != user_to_remove and exp.get("payee") != user_to_remove
     ]
     expenses_removed_count = original_expense_count - len(chat_data["expenses"])
 
@@ -561,7 +629,7 @@ async def remove_user_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     
     response = f"✅ User **{user_to_remove}** removed from the ledger."
     if expenses_removed_count > 0:
-        response += f" Also removed {expenses_removed_count} expenses paid by them."
+        response += f" Also removed {expenses_removed_count} expenses involving them as payer or payee."
 
     await update.message.reply_text(response, parse_mode='Markdown', reply_markup=main_menu_keyboard())
     return ConversationHandler.END
@@ -643,7 +711,7 @@ def main() -> None:
                 CallbackQueryHandler(button_handler, pattern="^menu$") 
             ],
             CHOOSING_PAYEE: [
-                CallbackQueryHandler(button_handler, pattern="^payee_.*$"),
+                CallbackQueryHandler(button_handler, pattern="^split_(group|single_.*)$"), # Accepts split_group OR split_single_Name
                 CallbackQueryHandler(button_handler, pattern="^menu$")
             ],
             # Text Input States (Handled by specific MessageHandlers)
@@ -670,7 +738,7 @@ def main() -> None:
     
     # --- General Callback Handler (for main menu buttons that don't start a conversation) ---
     application.add_handler(
-        CallbackQueryHandler(button_handler, pattern="^(view_summary|settle|manage_users|menu|view_expenses_log)$")
+        CallbackQueryHandler(button_handler, pattern="^(view_summary|settle|manage_users|menu|view_expenses_log|ignore)$")
     )
 
     # --- Error Handler ---

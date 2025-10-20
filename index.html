@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>KrispyLedger Café</title>
+  <style>
+    body {
+      font-family: "Poppins", "Comic Sans MS", sans-serif;
+      background: linear-gradient(180deg, #ffe6f0, #fff6fa);
+      color: #ff69b4;
+      text-align: center;
+      margin: 0;
+      padding: 0;
+    }
+    h1 {
+      font-size: 2em;
+      color: #ff4fa0;
+      margin-top: 30px;
+    }
+    .card {
+      background: white;
+      border-radius: 20px;
+      box-shadow: 0 4px 12px rgba(255, 0, 120, 0.1);
+      padding: 20px;
+      width: 85%;
+      margin: 20px auto;
+    }
+    button {
+      background-color: #ff91c1;
+      border: none;
+      border-radius: 12px;
+      color: white;
+      font-size: 1.1em;
+      padding: 10px 20px;
+      margin: 8px;
+      cursor: pointer;
+      transition: background-color 0.2s ease;
+    }
+    button:hover {
+      background-color: #ff78b0;
+    }
+    .footer {
+      color: #ff7bac;
+      font-size: 0.8em;
+      margin-top: 30px;
+    }
+  </style>
+</head>
+<body>
+  <h1>🍓 KrispyLedger Café 🌸</h1>
+
+  <div class="card">
+    <p>Welcome to your cute ledger! Track who paid whom — but make it *adorable* ✨</p>
+    <button id="addExpenseBtn">➕ Add Expense</button>
+    <button id="viewLedgerBtn">📜 View Ledger</button>
+    <button id="settleBtn">🍰 Settle Up</button>
+  </div>
+
+  <div class="footer">Made with 💖 by KrispyLedger</div>
+
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+  <script>
+    const tg = window.Telegram.WebApp;
+    tg.expand(); // make it full height
+
+    document.getElementById("addExpenseBtn").onclick = () => {
+      tg.sendData("add_expense"); // send to your bot
+    };
+    document.getElementById("viewLedgerBtn").onclick = () => {
+      tg.sendData("view_ledger");
+    };
+    document.getElementById("settleBtn").onclick = () => {
+      tg.sendData("settle");
+    };
+  </script>
+</body>
+</html>

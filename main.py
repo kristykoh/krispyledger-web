@@ -12,37 +12,44 @@ from telegram.ext import (
     filters,
 )
 
+# --- FIRESTORE DATABASE IMPORTS ---
+import firebase_admin
+from firebase_admin import credentials, firestore
+from google.cloud.firestore_v1 import Client # For type hinting
+
 # --- Configuration for Deployment ---
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 PORT = int(os.environ.get('PORT', 8080))
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
 
-# --- Persistence Setup (Simulated Database) ---
-# NOTE: This local file approach relies on you manually committing and pushing 
-# the all_ledgers.json file to Git to achieve persistence across restarts.
-LEDGER_FILE = "all_ledgers.json"
+# --- FIRESTORE SETUP ---
+# Environment variable for Firebase credentials JSON (e.g., 'FIREBASE_CREDENTIALS')
+FIREBASE_CONFIG_JSON = os.environ.get("FIREBASE_CREDENTIALS_JSON")
 
-def load_all_ledgers():
-    """Load all ledgers (keyed by chat_id) from file."""
-    if os.path.exists(LEDGER_FILE):
-        try:
-            with open(LEDGER_FILE, 'r') as f:
-                return json.load(f)
-        except (IOError, json.JSONDecodeError):
-            logger.warning("Could not load or parse ledger file. Starting fresh.")
-            return {}
-    return {}
+# Global Firestore client and collection reference
+db: Client = None
+LEDGERS_COLLECTION = 'krispy_ledgers' # Collection to store all chat ledgers
 
-def save_all_ledgers(data):
-    """Save all ledgers data to file."""
+def initialize_firestore():
+    """Initializes Firebase Admin SDK using credentials from environment variable."""
+    global db
+    if db is not None:
+        return # Already initialized
+
+    if not FIREBASE_CONFIG_JSON:
+        logging.error("FIREBASE_CREDENTIALS_JSON environment variable not set. Persistence will fail.")
+        raise EnvironmentError("Firebase credentials not configured.")
+
     try:
-        with open(LEDGER_FILE, 'w') as f:
-            json.dump(data, f, indent=4)
-    except IOError:
-        logger.error("Could not save ledger file.")
-
-# Global variable to hold all ledgers (keyed by chat_id)
-all_ledgers = load_all_ledgers()
+        # Load credentials from JSON string
+        cred_dict = json.loads(FIREBASE_CONFIG_JSON)
+        cred = credentials.Certificate(cred_dict)
+        firebase_admin.initialize_app(cred)
+        db = firestore.client()
+        logger.info("✅ Firestore client initialized successfully.")
+    except Exception as e:
+        logger.error(f"❌ Failed to initialize Firebase/Firestore: {e}")
+        raise
 
 # --- Logging ---
 logging.basicConfig(level=logging.INFO)
@@ -51,25 +58,46 @@ logger = logging.getLogger(__name__)
 # --- States ---
 CHOOSING_PAYER, CHOOSING_PAYEE, TYPING_AMOUNT, TYPING_DESC = range(4)
 
-# --- Chat-Specific Data Accessors ---
+# --- Database Accessors (ASYNC for Firestore) ---
 
-def get_chat_data(chat_id):
-    """Retrieves the data structure for the specific chat, initializing if necessary."""
-    # Data structure: {'ledger': {}, 'users': []}
-    chat_data = all_ledgers.setdefault(str(chat_id), {'ledger': {}, 'users': []})
+async def get_chat_data_async(chat_id):
+    """
+    Retrieves the data structure for the specific chat from Firestore, 
+    initializing if necessary.
+    """
+    chat_id_str = str(chat_id)
+    doc_ref = db.collection(LEDGERS_COLLECTION).document(chat_id_str)
+    
+    # Attempt to get the document
+    doc = await doc_ref.get()
+
+    if doc.exists:
+        chat_data = doc.to_dict()
+    else:
+        # Initialize default structure if not found
+        chat_data = {'ledger': {}, 'users': []}
+        # Save the initial structure to Firestore immediately
+        await doc_ref.set(chat_data)
+        logger.info(f"Initialized new ledger for chat ID: {chat_id_str}")
+
     return chat_data
 
-def get_current_users(chat_id):
-    """Get the list of user names for the current chat."""
-    return get_chat_data(chat_id)['users']
+async def save_chat_data_async(chat_id, data):
+    """Saves the entire chat data dictionary back to Firestore."""
+    chat_id_str = str(chat_id)
+    doc_ref = db.collection(LEDGERS_COLLECTION).document(chat_id_str)
+    try:
+        await doc_ref.set(data)
+    except Exception as e:
+        logger.error(f"Error saving data for chat {chat_id_str}: {e}")
 
-def get_current_ledger(chat_id):
-    """Get the actual expense data for the current chat."""
-    return get_chat_data(chat_id)['ledger']
+# Note: We must fetch the data before modifying it and then save it.
+# The previous global 'all_ledgers' and synchronous functions are replaced.
 
-# --- Helper functions (Updated to require chat_id) ---
-def add_expense(chat_id, payer, payee, amount, desc):
-    ledger = get_current_ledger(chat_id)
+# --- Helper functions (Updated to be ASYNC and use Firestore) ---
+async def add_expense(chat_id, payer, payee, amount, desc):
+    chat_data = await get_chat_data_async(chat_id)
+    ledger = chat_data['ledger']
     
     # Ensure nested dictionaries exist
     ledger.setdefault(payer, {})
@@ -80,11 +108,12 @@ def add_expense(chat_id, payer, payee, amount, desc):
     # Record the negative transaction (payee owes, represented as -amount relative to payer)
     ledger[payee].setdefault(payer, []).append({'amount': -amount, 'desc': desc})
     
-    save_all_ledgers(all_ledgers) # Save after every change
+    await save_chat_data_async(chat_id, chat_data) # Save after every change
 
-def format_ledger(chat_id):
-    ledger = get_current_ledger(chat_id)
-    USERS = get_current_users(chat_id)
+async def format_ledger(chat_id):
+    chat_data = await get_chat_data_async(chat_id)
+    ledger = chat_data['ledger']
+    USERS = chat_data['users']
     lines = ["🍓 *KrispyLedger Dashboard*\n"]
     any_entries = False
     balances = {}
@@ -121,10 +150,11 @@ def format_ledger(chat_id):
     return "\n".join(lines)
 
 
-def format_dashboard(chat_id):
+async def format_dashboard(chat_id):
     """Summary of net totals per user."""
-    ledger = get_current_ledger(chat_id)
-    USERS = get_current_users(chat_id)
+    chat_data = await get_chat_data_async(chat_id)
+    ledger = chat_data['ledger']
+    USERS = chat_data['users']
     lines = ["📊 *KrispyLedger Summary*\n"]
     
     if not ledger or not USERS:
@@ -165,7 +195,9 @@ def main_menu_keyboard():
 # --- Start command (Initial setup) ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    chat_data = get_chat_data(chat_id)
+    
+    # Fetch data from Firestore
+    chat_data = await get_chat_data_async(chat_id)
     
     # 1. Dynamic User Detection - Only set up if users are NOT already in the data structure
     if not chat_data['users']:
@@ -175,12 +207,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user2 = "Partner" 
         chat_data['users'] = [user1, user2]
         
+        # Save the new initial data structure to Firestore
+        await save_chat_data_async(chat_id, chat_data)
+
         message_text = (
             f"👋 Welcome! Tracking expenses between *{user1}* and *{user2}*.\n\n"
             f"Use the command `/rename Partner YourPartnerName` to set the correct name!"
         )
 
-        save_all_ledgers(all_ledgers)
         await update.message.reply_text(message_text, parse_mode="Markdown")
     
     sticker_file_id = "CAACAgUAAxkBAANKaPYBrywD5hefpEij_UAdhoBzBlYAApIZAAIzVrBXhicq0dBBHfo2BA"
@@ -193,7 +227,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --- Rename command (for initial setup or fixing typos) ---
 async def rename_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    chat_data = get_chat_data(chat_id)
+    chat_data = await get_chat_data_async(chat_id)
     USERS = chat_data['users']
     
     if len(context.args) != 2:
@@ -225,7 +259,7 @@ async def rename_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if old_name in debts:
                 debts[new_name] = debts.pop(old_name)
         
-        save_all_ledgers(all_ledgers)
+        await save_chat_data_async(chat_id, chat_data)
         await update.message.reply_text(f"✅ Renamed *{old_name}* to *{new_name}*. Current users: {', '.join(USERS)}", parse_mode="Markdown", reply_markup=main_menu_keyboard())
 
     except Exception as e:
@@ -236,7 +270,7 @@ async def rename_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --- Command to ADD a new user ---
 async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    chat_data = get_chat_data(chat_id)
+    chat_data = await get_chat_data_async(chat_id)
     USERS = chat_data['users']
     
     if len(context.args) != 1:
@@ -254,7 +288,7 @@ async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     USERS.append(new_name)
-    save_all_ledgers(all_ledgers)
+    await save_chat_data_async(chat_id, chat_data)
     
     await update.message.reply_text(
         f"✅ User *{new_name}* added! Current users: {', '.join(USERS)}", 
@@ -265,7 +299,7 @@ async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --- Command to DELETE a user ---
 async def delete_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    chat_data = get_chat_data(chat_id)
+    chat_data = await get_chat_data_async(chat_id)
     USERS = chat_data['users']
     ledger = chat_data['ledger']
     
@@ -301,7 +335,7 @@ async def delete_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not ledger[payer]:
             del ledger[payer]
 
-    save_all_ledgers(all_ledgers)
+    await save_chat_data_async(chat_id, chat_data)
     
     await update.message.reply_text(
         f"🗑️ User *{del_name}* deleted and all related debt records cleared. Current users: {', '.join(USERS)}", 
@@ -317,10 +351,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     chat_id = update.effective_chat.id
     
-    USERS = get_current_users(chat_id)
+    chat_data = await get_chat_data_async(chat_id)
+    USERS = chat_data['users']
     
     if not USERS or len(USERS) < 2:
-        await query.edit_message_text("❌ Please run /start first to set up two users.", reply_markup=main_menu_keyboard())
+        # Note: If users are missing, we should ask them to restart
+        await query.edit_message_text("❌ Users are not set. Please send /start to initialize your ledger.", reply_markup=main_menu_keyboard())
         return ConversationHandler.END
 
     if data == "add_expense":
@@ -330,12 +366,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return CHOOSING_PAYER
 
     elif data == "view_ledger":
-        await query.edit_message_text(format_ledger(chat_id), parse_mode="Markdown", reply_markup=main_menu_keyboard())
+        ledger_text = await format_ledger(chat_id)
+        await query.edit_message_text(ledger_text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
         return ConversationHandler.END
 
     elif data == "settle":
-        get_chat_data(chat_id)['ledger'].clear()
-        save_all_ledgers(all_ledgers)
+        chat_data['ledger'].clear()
+        await save_chat_data_async(chat_id, chat_data)
         
         sticker_file_id = "CAACAgUAAxkBAANLaPYBv0rdel-B2DWPXw9fzsYEneEAApUZAAIzVrBX4g5-PwqYYwE2BA"
         await query.message.reply_sticker(sticker_file_id)
@@ -343,7 +380,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     elif data == "summary":
-        await query.edit_message_text(format_dashboard(chat_id), parse_mode="Markdown", reply_markup=main_menu_keyboard())
+        dashboard_text = await format_dashboard(chat_id)
+        await query.edit_message_text(dashboard_text, parse_mode="Markdown", reply_markup=main_menu_keyboard())
         return ConversationHandler.END
 
     elif data.startswith("payer_"):
@@ -395,14 +433,18 @@ async def desc_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     payee = context.user_data['payee']
     amount = context.user_data['amount']
 
-    add_expense(chat_id, payer, payee, amount, desc)
+    # New async function call
+    await add_expense(chat_id, payer, payee, amount, desc)
 
     sticker_file_id = "CAACAgUAAxkBAANZaPYFMY2-hhDFqWMrxJH3sAijDSQAAqIZAAIzVrBXQRy_bzCSPF02BA"
     await update.message.reply_sticker(sticker_file_id)
+    
+    # New async function call
+    dashboard_text = await format_dashboard(chat_id)
 
     await update.message.reply_text(
         f"✅ Recorded: *{payer}* paid *{payee}* ${amount:.2f} for _{desc}_\n\n" +
-        format_dashboard(chat_id), 
+        dashboard_text, 
         parse_mode="Markdown",
         reply_markup=main_menu_keyboard()
     )
@@ -420,6 +462,13 @@ def main():
     if not BOT_TOKEN:
         logger.error("BOT_TOKEN environment variable not set.")
         return
+
+    # Initialize Firestore BEFORE building the application
+    try:
+        initialize_firestore()
+    except Exception:
+        logger.error("Application shutdown due to missing/invalid Firebase configuration.")
+        return # Halt execution if database fails to initialize
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
@@ -444,13 +493,11 @@ def main():
     # --- Deployment Logic ---
     if WEBHOOK_URL and BOT_TOKEN:
         logger.info(f"✅ Running in WEBHOOK mode. URL: {WEBHOOK_URL} listening on port {PORT}")
-        # FIX: Using a simple, static path for the webhook listener is more robust.
-        # The external webhook URL is set to use this same path.
         app.run_webhook(
             listen="0.0.0.0",
             port=PORT,
-            url_path="webhook", # Changed from BOT_TOKEN
-            webhook_url=f"{WEBHOOK_URL}/webhook" # Changed to match the new url_path
+            url_path="webhook", 
+            webhook_url=f"{WEBHOOK_URL}/webhook"
         )
     else:
         logger.info("⚠️ Running in POLLING mode (for local development only).")

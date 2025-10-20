@@ -1,6 +1,5 @@
 import logging
 import os
-import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
@@ -168,7 +167,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 # --- Main ---
-async def main_async():
+def main():
     BOT_TOKEN = os.environ.get("BOT_TOKEN")
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
@@ -188,8 +187,7 @@ async def main_async():
     app.add_handler(conv)
 
     print("🌸 KrispyLedger Bot running...")
-    await app.run_polling()
+    app.run_polling()
 
 if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main_async())
+    main()

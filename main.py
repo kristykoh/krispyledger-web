@@ -114,13 +114,11 @@ def save_chat_data_sync(chat_id: int, chat_data: Dict[str, Any]) -> None:
 
 # --- Helper Functions for Data Access (Asynchronous) ---
 
-async def load_chat_data_async(context: ContextTypes.DEFAULT_TYPE) -> None:
+async def load_chat_data_async(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Loads chat data from Firestore into context.chat_data using an executor 
-    to prevent blocking the event loop. Must be called at the start of every handler.
+    Loads chat data from Firestore into context.chat_data using an executor.
+    Requires chat_id to be passed explicitly from the handler.
     """
-    # Use context.job.chat_id if available (for scheduled jobs), otherwise use effective_chat.id
-    chat_id = context.job.chat_id if context.job else context.effective_chat.id
     app_loop = context.application.loop
 
     if "data_loaded" not in context.chat_data:
@@ -136,19 +134,18 @@ def get_chat_data(context: ContextTypes.DEFAULT_TYPE) -> Dict[str, Any]:
     Retrieves chat data from context.chat_data. 
     Assumes load_chat_data_async has already been awaited.
     """
-    # Check if data was loaded. If not, this is an error in handler logic, 
-    # but we return an empty structure to prevent immediate crash.
+    # Defensive check: if 'users' isn't in chat_data, data wasn't loaded or an error occurred.
     if "users" not in context.chat_data:
          logger.error("🚨 get_chat_data called before data was loaded asynchronously.")
          return {"users": {}, "expenses": [], "next_expense_id": 1}
     
     return context.chat_data
 
-async def save_chat_data_async(context: ContextTypes.DEFAULT_TYPE) -> None:
+async def save_chat_data_async(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Saves chat data back to Firestore using an executor.
+    Requires chat_id to be passed explicitly from the handler.
     """
-    chat_id = context.effective_chat.id
     app_loop = context.application.loop
     
     # We save the entire chat_data dictionary, excluding the 'data_loaded' flag
@@ -158,8 +155,7 @@ async def save_chat_data_async(context: ContextTypes.DEFAULT_TYPE) -> None:
     await app_loop.run_in_executor(None, save_chat_data_sync, chat_id, data_to_save)
 
 
-# --- Ledger Logic Functions ---
-
+# --- Ledger Logic Functions (Same as before) ---
 def calculate_balances(chat_data: Dict[str, Any]) -> Dict[str, float]:
     """Calculates the net balance for each user."""
     balances = {name: 0.0 for name in chat_data["users"].keys()}
@@ -251,15 +247,15 @@ def simplify_settlements(balances: Dict[str, float]) -> list[str]:
 
     return suggestions
 
-# --- Command Handlers (Updated to use async data access) ---
+# --- Command Handlers (Updated to pass chat_id) ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Sends a welcome message and initializes the ledger."""
+    # RELIABLE: Use update.effective_chat.id as the source of truth
     chat_id = update.effective_chat.id
     
-    # NEW: Asynchronously load data from Firestore (non-blocking)
-    await load_chat_data_async(context)
-    # Data is now guaranteed to be in context.chat_data
+    # Pass the reliable chat_id to the data loader
+    await load_chat_data_async(chat_id, context)
     chat_data = get_chat_data(context) 
     
     welcome_message = (
@@ -277,8 +273,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def view_ledger(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Displays the current users, expenses, and balances."""
-    # NEW: Asynchronously load data from Firestore (non-blocking)
-    await load_chat_data_async(context)
+    chat_id = update.effective_chat.id
+    await load_chat_data_async(chat_id, context)
     chat_data = get_chat_data(context)
     
     if not chat_data["users"]:
@@ -315,26 +311,25 @@ async def view_ledger(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def clear_ledger(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Clears all users and expenses from the ledger."""
-    # NEW: Asynchronously load data from Firestore (non-blocking)
-    await load_chat_data_async(context)
+    chat_id = update.effective_chat.id
+    await load_chat_data_async(chat_id, context)
     chat_data = get_chat_data(context)
     
     chat_data["users"] = {}
     chat_data["expenses"] = []
     chat_data["next_expense_id"] = 1
     
-    # NEW: Asynchronously save data
-    await save_chat_data_async(context)
+    await save_chat_data_async(chat_id, context)
     await update.message.reply_text(
         "🗑️ Ledger cleared! All users and expenses have been removed."
     )
 
-# --- Add User Conversation Handlers (Updated to use async data access) ---
+# --- Add User Conversation Handlers ---
 
 async def add_user_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Starts the conversation for adding users."""
-    # NEW: Asynchronously load data from Firestore (non-blocking)
-    await load_chat_data_async(context)
+    chat_id = update.effective_chat.id
+    await load_chat_data_async(chat_id, context)
     await update.message.reply_text(
         "Please send the name of the user you want to add (e.g., Jane Doe). Send /done when finished."
     )
@@ -343,6 +338,7 @@ async def add_user_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def add_user_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Processes the user name and adds it to the ledger."""
     # Data is guaranteed to be loaded from the entry point (add_user_start)
+    chat_id = update.effective_chat.id
     chat_data = get_chat_data(context)
 
     user_name = update.message.text.strip()
@@ -358,8 +354,7 @@ async def add_user_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     # Add user
     chat_data["users"][user_name] = {}  # Placeholder for future user metadata
     
-    # NEW: Asynchronously save data
-    await save_chat_data_async(context)
+    await save_chat_data_async(chat_id, context)
     await update.message.reply_text(
         f"✅ User **{user_name}** added. Send another name or /done.", parse_mode='Markdown'
     )
@@ -370,13 +365,12 @@ async def add_user_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     await update.message.reply_text("Finished adding users. Use /view to check your ledger.")
     return ConversationHandler.END
 
-# --- Add Expense Conversation Handlers (Updated to use async data access) ---
-# Context data will store: {"payer": "", "amount": 0.0, "description": ""}
+# --- Add Expense Conversation Handlers ---
 
 async def add_expense_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Starts the conversation for adding an expense."""
-    # NEW: Asynchronously load data from Firestore (non-blocking)
-    await load_chat_data_async(context)
+    chat_id = update.effective_chat.id
+    await load_chat_data_async(chat_id, context)
     chat_data = get_chat_data(context)
     
     if not chat_data["users"]:
@@ -435,6 +429,7 @@ async def add_expense_amount(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def add_expense_description(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Processes the description and saves the expense."""
     # Data is guaranteed to be loaded from the entry point (add_expense_start)
+    chat_id = update.effective_chat.id
     chat_data = get_chat_data(context)
 
     description = update.message.text.strip()
@@ -455,8 +450,7 @@ async def add_expense_description(update: Update, context: ContextTypes.DEFAULT_
     chat_data["expenses"].append(new_expense)
     chat_data["next_expense_id"] += 1
     
-    # NEW: Asynchronously save data
-    await save_chat_data_async(context)
+    await save_chat_data_async(chat_id, context)
 
     await update.message.reply_text(
         f"✅ Expense recorded! ID {new_expense['id']}: **{description}** (Paid by {new_expense['payer']} for ${new_expense['amount']:.2f}).\n\nUse /view to see the new balances.",
@@ -467,12 +461,12 @@ async def add_expense_description(update: Update, context: ContextTypes.DEFAULT_
     context.user_data.pop("expense_data", None) 
     return ConversationHandler.END
 
-# --- Remove User Conversation Handlers (Updated to use async data access) ---
+# --- Remove User Conversation Handlers ---
 
 async def remove_user_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Starts the conversation for removing a user."""
-    # NEW: Asynchronously load data from Firestore (non-blocking)
-    await load_chat_data_async(context)
+    chat_id = update.effective_chat.id
+    await load_chat_data_async(chat_id, context)
     chat_data = get_chat_data(context)
     
     if not chat_data["users"]:
@@ -489,6 +483,7 @@ async def remove_user_start(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 async def remove_user_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Removes the specified user and their associated expenses."""
     # Data is guaranteed to be loaded from the entry point (remove_user_start)
+    chat_id = update.effective_chat.id
     chat_data = get_chat_data(context)
 
     user_to_remove = update.message.text.strip()
@@ -510,8 +505,7 @@ async def remove_user_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     ]
     expenses_removed_count = original_expense_count - len(chat_data["expenses"])
 
-    # NEW: Asynchronously save data
-    await save_chat_data_async(context)
+    await save_chat_data_async(chat_id, context)
     
     response = f"✅ User **{user_to_remove}** removed from the ledger."
     if expenses_removed_count > 0:
@@ -622,7 +616,6 @@ def main() -> None:
     # --- Start the Bot (Webhook Mode) ---
 
     # Extract the token from the BOT_TOKEN variable for the webhook path
-    # Telegram requires the URL path to include the token for verification
     webhook_path = "/" + BOT_TOKEN 
     
     # Check if the URL already has a trailing slash. If it does, we strip it.

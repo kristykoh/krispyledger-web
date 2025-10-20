@@ -293,17 +293,27 @@ async def clear_ledger(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         reply_markup=main_menu_keyboard()
     )
 
-# --- Conversation Entry Point (for /addexpense command) ---
+# --- Conversation Entry Point (for /addexpense command and button) ---
 
 async def start_add_expense_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Starts the expense conversation when the user types /addexpense."""
+    """
+    Starts the expense conversation when the user types /addexpense or clicks the button.
+    This function must be robust against both Message and CallbackQuery updates.
+    """
     chat_id = update.effective_chat.id
     await load_chat_data_async(chat_id, context)
     chat_data = get_chat_data(context)
     users = list(chat_data["users"].keys())
     
+    # --- FIX APPLIED HERE: Use update.effective_message ---
+    effective_message = update.effective_message
+    if not effective_message:
+        logger.error("start_add_expense_command: effective_message is None, cannot reply.")
+        return ConversationHandler.END
+
+
     if not users:
-        await update.message.reply_text(
+        await effective_message.reply_text(
             "❌ Please add users first using /adduser (via text command).", 
             reply_markup=main_menu_keyboard()
         )
@@ -314,7 +324,10 @@ async def start_add_expense_command(update: Update, context: ContextTypes.DEFAUL
     keyboard.append([InlineKeyboardButton("⬅️ Back to Menu", callback_data="menu")])
     
     # Send a new message to start the flow
-    await update.message.reply_text("🧐 Who paid for the expense?", reply_markup=InlineKeyboardMarkup(keyboard))
+    await effective_message.reply_text(
+        "🧐 Who paid for the expense?", 
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
     return CHOOSING_PAYER
 
 
@@ -329,7 +342,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # --- Main Menu Handling (Conversation Entry/Exit) ---
     if data == "add_expense":
-        # Simulate pressing the command
+        # Call the corrected start function
         return await start_add_expense_command(update, context)
 
     elif data == "view_summary":

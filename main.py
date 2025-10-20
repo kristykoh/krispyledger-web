@@ -1,5 +1,6 @@
 import logging
 import os
+import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
@@ -80,10 +81,8 @@ def main_menu_keyboard():
 
 # --- Start command ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Welcome sticker
     sticker_file_id = "CAACAgUAAxkBAANKaPYBrywD5hefpEij_UAdhoBzBlYAApIZAAIzVrBXhicq0dBBHfo2BA"
     await update.message.reply_sticker(sticker_file_id)
-
     await update.message.reply_text(
         "🌸 Welcome to KrispyLedger! Tap a button to start:",
         reply_markup=main_menu_keyboard()
@@ -106,7 +105,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "settle":
         ledger.clear()
-        # Fun sticker
         sticker_file_id = "CAACAgUAAxkBAANLaPYBv0rdel-B2DWPXw9fzsYEneEAApUZAAIzVrBX4g5-PwqYYwE2BA"
         await query.message.reply_sticker(sticker_file_id)
         await query.edit_message_text("🍰 All balances cleared!", reply_markup=main_menu_keyboard())
@@ -151,9 +149,8 @@ async def desc_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     payee = context.user_data['payee']
     amount = context.user_data['amount']
 
-    add_expense(payer, payee, amount, desc)  # Add description
+    add_expense(payer, payee, amount, desc)
 
-    # Celebratory sticker
     sticker_file_id = "CAACAgUAAxkBAANZaPYFMY2-hhDFqWMrxJH3sAijDSQAAqIZAAIzVrBXQRy_bzCSPF02BA"
     await update.message.reply_sticker(sticker_file_id)
 
@@ -171,7 +168,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 # --- Main ---
-def main():
+async def main_async():
     BOT_TOKEN = os.environ.get("BOT_TOKEN")
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
@@ -191,7 +188,8 @@ def main():
     app.add_handler(conv)
 
     print("🌸 KrispyLedger Bot running...")
-    app.run_polling()
+    await app.run_polling()
 
 if __name__ == "__main__":
-    main()
+    import asyncio
+    asyncio.run(main_async())

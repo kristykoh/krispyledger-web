@@ -1,7 +1,7 @@
 import os
 import json
 import logging
-import asyncio
+import asyncio # <-- REQUIRED FOR asyncio.get_running_loop()
 from typing import Dict, Any, Optional
 
 # Third-party libraries
@@ -119,7 +119,8 @@ async def load_chat_data_async(chat_id: int, context: ContextTypes.DEFAULT_TYPE)
     Loads chat data from Firestore into context.chat_data using an executor.
     Requires chat_id to be passed explicitly from the handler.
     """
-    app_loop = context.application.loop
+    # FIX: Use asyncio.get_running_loop() as context.application.loop is deprecated/removed in PTB v20+
+    app_loop = asyncio.get_running_loop() 
 
     if "data_loaded" not in context.chat_data:
         # Await the synchronous call running in a separate thread
@@ -146,7 +147,8 @@ async def save_chat_data_async(chat_id: int, context: ContextTypes.DEFAULT_TYPE)
     Saves chat data back to Firestore using an executor.
     Requires chat_id to be passed explicitly from the handler.
     """
-    app_loop = context.application.loop
+    # FIX: Use asyncio.get_running_loop() 
+    app_loop = asyncio.get_running_loop()
     
     # We save the entire chat_data dictionary, excluding the 'data_loaded' flag
     data_to_save = {k: v for k, v in context.chat_data.items() if k != "data_loaded"}
